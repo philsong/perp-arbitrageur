@@ -16,6 +16,7 @@ import { Service } from "typedi"
 import { Wallet } from "ethers"
 import Big from "big.js"
 import FTXRest from "ftx-api-rest"
+import {min} from "./bn"
 
 @Service()
 export class Arbitrageur {
@@ -317,6 +318,7 @@ export class Arbitrageur {
                     this.log.jinfo({
                         event: "MitigateFTXPositionSizeDiff",
                         params: {
+                            marketId: ftxPosition.future,
                             perpfiPositionSize,
                             ftxPositionSize,
                             ftxSizeDiff,
@@ -377,34 +379,44 @@ export class Arbitrageur {
             } else if (
                 marginRatio.lt(expectedMarginRatio.mul(new Big(1).sub(ammConfig.ADJUST_MARGIN_RATIO_THRESHOLD)))
             ) {
+                const feeSafetyMargin = ammConfig.ASSET_CAP
+                  .mul(2) // max double the asset cap when reverse positions
+                  .mul(this.perpfiFee)
+                  .mul(2) // one successful trade consists of two txs
+                const freeQuoteBalance = quoteBalance.gt(feeSafetyMargin)? quoteBalance.minus(feeSafetyMargin) : Big(0)
                 // marginToBeAdded = marginToChange
                 //                 = (expectedMarginRatio - marginRatio) * openNotional
                 let marginToBeAdded = expectedMarginRatio.sub(marginRatio).mul(position.openNotional)
-                marginToBeAdded = marginToBeAdded.gt(quoteBalance) ? quoteBalance : marginToBeAdded
-                this.log.jinfo({
-                    event: "AddMargin",
-                    params: { marginToBeAdded: marginToBeAdded.toFixed(), baseAssetSymbol: priceFeedKey },
-                })
-
-                const release = await this.nonceMutex.acquire()
-                let tx
-                try {
-                    tx = await this.perpService.addMargin(this.arbitrageur, amm.address, marginToBeAdded, {
-                        nonce: this.nextNonce,
-                        gasPrice: await this.ethService.getSafeGasPrice(),
-                    })
-                    this.nextNonce++
-                } finally {
-                    release()
+                if (marginToBeAdded.gt(freeQuoteBalance)) {
+                    marginToBeAdded = freeQuoteBalance
                 }
-                await tx.wait()
-                this.log.jinfo({
-                    event: "MarginRatioAfter",
-                    params: {
-                        marginRatio: (await this.perpService.getMarginRatio(amm.address, arbitrageurAddr)).toFixed(),
-                        baseAssetSymbol: priceFeedKey,
-                    },
-                })
+
+                if (marginToBeAdded.gt(Big(0))) {
+                    this.log.jinfo({
+                        event: "AddMargin",
+                        params: {marginToBeAdded: marginToBeAdded.toFixed(), baseAssetSymbol: priceFeedKey},
+                    })
+
+                    const release = await this.nonceMutex.acquire()
+                    let tx
+                    try {
+                        tx = await this.perpService.addMargin(this.arbitrageur, amm.address, marginToBeAdded, {
+                            nonce: this.nextNonce,
+                            gasPrice: await this.ethService.getSafeGasPrice(),
+                        })
+                        this.nextNonce++
+                    } finally {
+                        release()
+                    }
+                    await tx.wait()
+                    this.log.jinfo({
+                        event: "MarginRatioAfter",
+                        params: {
+                            marginRatio: (await this.perpService.getMarginRatio(amm.address, arbitrageurAddr)).toFixed(),
+                            baseAssetSymbol: priceFeedKey,
+                        },
+                    })
+                }
             }
         }
 
@@ -444,7 +456,7 @@ export class Arbitrageur {
 
         // Open positions if needed
         if (spread.lt(ammConfig.PERPFI_LONG_ENTRY_TRIGGER)) {
-            const regAmount = this.calculateRegulatedPositionNotional(ammConfig, quoteBalance, amount, position, Side.BUY)
+            const regAmount = this.calculateRegulatedPositionNotional(ammConfig, quoteBalance, amount, position, Side.BUY, unrealizedPnl)
             const ftxPositionSizeAbs = this.calculateFTXpositionSize(ammConfig, regAmount, ftxPrice)
             if (ftxPositionSizeAbs.eq(Big(0))) {
                 return
@@ -455,7 +467,7 @@ export class Arbitrageur {
                 this.openPerpFiPosition(amm, priceFeedKey, regAmount, ammConfig.PERPFI_LEVERAGE, Side.BUY),
             ])
         } else if (spread.gt(ammConfig.PERPFI_SHORT_ENTRY_TRIGGER)) {
-            const regAmount = this.calculateRegulatedPositionNotional(ammConfig, quoteBalance, amount, position, Side.SELL)
+            const regAmount = this.calculateRegulatedPositionNotional(ammConfig, quoteBalance, amount, position, Side.SELL, unrealizedPnl)
             const ftxPositionSizeAbs = this.calculateFTXpositionSize(ammConfig, regAmount, ftxPrice)
             if (ftxPositionSizeAbs.eq(Big(0))) {
                 return
@@ -481,46 +493,11 @@ export class Arbitrageur {
         return `${ammState.baseAssetSymbol}-${ammState.quoteAssetSymbol}`
     }
 
-    calculateRegulatedPositionNotional(ammConfig: AmmConfig, quoteBalance: Big, maxSlippageAmount: Big, position: Position, side: Side): Big {
-        let maxOpenNotional = Big(0)
-
-        // asset cap >> 1000
-        // you have long position notional >> 900
-        // you can short >> 1900 maximum
-        if (position.size.gte(0) && side == Side.SELL) {
-            maxOpenNotional = ammConfig.ASSET_CAP.add(position.openNotional)
-        }
-
-        // asset cap >> 1000
-        // you have short position notional >> 900
-        // you can long >> 1900 maximum
-        else if (position.size.lte(0) && side == Side.BUY) {
-            maxOpenNotional = ammConfig.ASSET_CAP.add(position.openNotional)
-        }
-
-        // asset cap >> 1000
-        // you have long position notional >> 900
-        // you can long >> 100 maximum
-        else if (position.size.gte(0) && side == Side.BUY) {
-            maxOpenNotional = ammConfig.ASSET_CAP.sub(position.openNotional)
-            if (maxOpenNotional.lt(0)) {
-                maxOpenNotional = Big(0)
-            }
-        }
-
-        // asset cap >> 1000
-        // you have short position notional >> 900
-        // you can short >> 100 maximum
-        else if (position.size.lte(0) && side == Side.SELL) {
-            maxOpenNotional = ammConfig.ASSET_CAP.sub(position.openNotional)
-            if (maxOpenNotional.lt(0)) {
-                maxOpenNotional = Big(0)
-            }
-        }
+    calculateRegulatedPositionNotional(ammConfig: AmmConfig, quoteBalance: Big, maxSlippageAmount: Big, position: Position, side: Side, unrealizedPnl: Big): Big {
+        const availableOpenNotional = this.calcAvailableOpenNotional(ammConfig, quoteBalance, maxSlippageAmount, position, side, unrealizedPnl)
 
         let amount = maxSlippageAmount
-        if (amount.gt(maxOpenNotional)) {
-            amount = maxOpenNotional
+        if (amount.gt(availableOpenNotional)) {
             this.log.jinfo({
                 event: "AmountPerpFiExceedCap",
                 params: {
@@ -529,15 +506,11 @@ export class Arbitrageur {
                     size: +position.size,
                     openNotional: +position.openNotional,
                     maxSlippageAmount: +maxSlippageAmount,
-                    maxOpenNotional: +maxOpenNotional,
+                    availableOpenNotional: +availableOpenNotional,
                     amount: +amount,
                 },
             })
-        }
-
-        const feeSafetyMargin = ammConfig.ASSET_CAP.mul(this.perpfiFee).mul(3)
-        if (amount.gt(quoteBalance.sub(feeSafetyMargin).mul(ammConfig.PERPFI_LEVERAGE))) {
-            amount = quoteBalance.sub(feeSafetyMargin).mul(ammConfig.PERPFI_LEVERAGE)
+            amount = availableOpenNotional
         }
 
         if (amount.lt(ammConfig.PERPFI_MIN_TRADE_NOTIONAL)) {
@@ -550,8 +523,7 @@ export class Arbitrageur {
                     size: +position.size,
                     openNotional: +position.openNotional,
                     maxSlippageAmount: +maxSlippageAmount,
-                    maxOpenNotional: +maxOpenNotional,
-                    feeSafetyMargin: +feeSafetyMargin,
+                    availableOpenNotional: +availableOpenNotional,
                     amount: +amount,
                 },
             })
@@ -564,8 +536,7 @@ export class Arbitrageur {
                     size: +position.size,
                     openNotional: +position.openNotional,
                     maxSlippageAmount: +maxSlippageAmount,
-                    maxOpenNotional: +maxOpenNotional,
-                    feeSafetyMargin: +feeSafetyMargin,
+                    availableOpenNotional: +availableOpenNotional,
                     amount: +amount,
                 },
             })
@@ -578,13 +549,83 @@ export class Arbitrageur {
                     size: +position.size,
                     openNotional: +position.openNotional,
                     maxSlippageAmount: +maxSlippageAmount,
-                    maxOpenNotional: +maxOpenNotional,
-                    feeSafetyMargin: +feeSafetyMargin,
+                    availableOpenNotional: +availableOpenNotional,
                     amount: +amount,
                 },
             })
         }
         return amount
+    }
+
+    calcAvailableOpenNotional(ammConfig: AmmConfig, quoteBalance: Big, maxSlippageAmount: Big, position: Position, side: Side, unrealizedPnl: Big): Big {
+        if (
+          (position.size.gt(0) && side == Side.SELL) ||
+          (position.size.lte(0) && side == Side.BUY)
+        ) {
+            // open position in the opposite direction
+            // you are allowed to open as much as:                          maxOpenNotional = assetCap + existingOpenNotional
+            const maxOpenNotional = ammConfig.ASSET_CAP.add(position.openNotional)
+
+            // you need at least some fee to pay for open/close position:   feeSafetyMargin = maxOpenNotional * feeRate * 2
+            const feeSafetyMargin = maxOpenNotional.mul(this.perpfiFee).mul(2)
+
+            // you have fund to open as much as:                            availableOpenNotional = min((wallet + margin + unrealizedPnl - feeSafetyMargin) * leverage, maxOpenNotional)
+            const availableOpenNotional = min([
+              quoteBalance.plus(position.margin).plus(unrealizedPnl).minus(feeSafetyMargin).mul(ammConfig.PERPFI_LEVERAGE),
+              maxOpenNotional,
+            ])
+
+            this.log.jinfo({
+                event: "CalcAvailableOpenNotionalOppositeSide",
+                params: {
+                    ASSET_CAP: +ammConfig.ASSET_CAP,
+                    existingOpenNotional: +position.openNotional,
+                    maxOpenNotional: +maxOpenNotional,
+                    perpfiFee: +this.perpfiFee,
+                    feeSafetyMargin: +feeSafetyMargin,
+                    quoteBalance: +quoteBalance,
+                    existingMargin: +position.margin,
+                    unrealizedPnl: +unrealizedPnl,
+                    leverage: +ammConfig.PERPFI_LEVERAGE,
+                    availableOpenNotional: +availableOpenNotional,
+                }
+            })
+
+            return availableOpenNotional
+
+        } else {
+            // open new position or in the same direction
+            // you are allowed to open as much as:                          maxOpenNotional = max(0, assetCap - existingOpenNotional)
+            let maxOpenNotional = ammConfig.ASSET_CAP.sub(position.openNotional)
+            if (maxOpenNotional.lt(0)) {
+                maxOpenNotional = Big(0)
+            }
+
+            // you need at least some fee to pay for open/close position:   feeSafetyMargin = maxOpenNotional * feeRate * 2
+            const feeSafetyMargin = maxOpenNotional.mul(this.perpfiFee).mul(2)
+
+            // you have fund to open as much as:                            availableOpenNotional = min((wallet - feeSafetyMargin) * leverage, maxOpenNotional)
+            const availableOpenNotional = min([
+                quoteBalance.minus(feeSafetyMargin).mul(ammConfig.PERPFI_LEVERAGE),
+                maxOpenNotional,
+            ])
+
+            this.log.jinfo({
+                event: "CalcAvailableOpenNotionalSameSide",
+                params: {
+                    ASSET_CAP: +ammConfig.ASSET_CAP,
+                    existingOpenNotional: +position.openNotional,
+                    maxOpenNotional: +maxOpenNotional,
+                    perpfiFee: +this.perpfiFee,
+                    feeSafetyMargin: +feeSafetyMargin,
+                    quoteBalance: +quoteBalance,
+                    leverage: +ammConfig.PERPFI_LEVERAGE,
+                    availableOpenNotional: +availableOpenNotional,
+                }
+            })
+
+            return availableOpenNotional
+        }
     }
 
     calculateFTXpositionSize(ammConfig: AmmConfig, perpFiRegulatedPositionNotional: Big, ftxPrice: Big): Big {
